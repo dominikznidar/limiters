@@ -2,15 +2,12 @@ package limiters
 
 import (
 	"context"
-	"fmt"
 	"reflect"
 	"strconv"
 	"sync"
 	"time"
 
-	"github.com/coreos/etcd/clientv3"
-	"github.com/coreos/etcd/etcdserver/api/v3rpc/rpctypes"
-	"github.com/go-redis/redis"
+	redis "github.com/go-redis/redis/v8"
 	"github.com/pkg/errors"
 )
 
@@ -124,141 +121,6 @@ func (l *LeakyBucketInMemory) SetState(ctx context.Context, state LeakyBucketSta
 }
 
 const (
-	etcdKeyLBLease = "lease"
-	etcdKeyLBLast  = "last"
-)
-
-// LeakyBucketEtcd is an etcd implementation of a LeakyBucketStateBackend.
-// See the TokenBucketEtcd description for the details on etcd usage.
-type LeakyBucketEtcd struct {
-	// prefix is the etcd key prefix.
-	prefix      string
-	cli         *clientv3.Client
-	leaseID     clientv3.LeaseID
-	ttl         time.Duration
-	raceCheck   bool
-	lastVersion int64
-}
-
-// NewLeakyBucketEtcd creates a new LeakyBucketEtcd instance.
-// Prefix is used as an etcd key prefix for all keys stored in etcd by this algorithm.
-// TTL is a TTL of the etcd lease used to store all the keys.
-//
-// If raceCheck is true and the keys in etcd are modified in between State() and SetState() calls then
-// ErrRaceCondition is returned.
-func NewLeakyBucketEtcd(cli *clientv3.Client, prefix string, ttl time.Duration, raceCheck bool) *LeakyBucketEtcd {
-	return &LeakyBucketEtcd{
-		prefix:    prefix,
-		cli:       cli,
-		ttl:       ttl,
-		raceCheck: raceCheck,
-	}
-}
-
-// State gets the bucket's current state from etcd.
-// If there is no state available in etcd then the initial bucket's state is returned.
-func (l *LeakyBucketEtcd) State(ctx context.Context) (LeakyBucketState, error) {
-	// Reset the lease ID as it will be updated by the successful Get operation below.
-	l.leaseID = 0
-	// Get all the keys under the prefix in a single request.
-	r, err := l.cli.Get(ctx, l.prefix, clientv3.WithRange(incPrefix(l.prefix)))
-	if err != nil {
-		return LeakyBucketState{}, errors.Wrapf(err, "failed to get keys in range ['%s', '%s') from etcd", l.prefix, incPrefix(l.prefix))
-	}
-	if len(r.Kvs) == 0 {
-		return LeakyBucketState{}, nil
-	}
-	state := LeakyBucketState{}
-	parsed := 0
-	var v int64
-	for _, kv := range r.Kvs {
-		switch string(kv.Key) {
-		case etcdKey(l.prefix, etcdKeyLBLast):
-			v, err = parseEtcdInt64(kv)
-			if err != nil {
-				return LeakyBucketState{}, err
-			}
-			state.Last = v
-			parsed |= 1
-			l.lastVersion = kv.Version
-
-		case etcdKey(l.prefix, etcdKeyLBLease):
-			v, err = parseEtcdInt64(kv)
-			if err != nil {
-				return LeakyBucketState{}, err
-			}
-			l.leaseID = clientv3.LeaseID(v)
-			parsed |= 2
-		}
-	}
-	if parsed != 3 {
-		return LeakyBucketState{}, errors.New("failed to get state from etcd: some keys are missing")
-	}
-	return state, nil
-}
-
-// createLease creates a new lease in etcd and updates the t.leaseID value.
-func (l *LeakyBucketEtcd) createLease(ctx context.Context) error {
-	lease, err := l.cli.Grant(ctx, int64(l.ttl/time.Nanosecond))
-	if err != nil {
-		return errors.Wrap(err, "failed to create a new lease in etcd")
-	}
-	l.leaseID = lease.ID
-	return nil
-}
-
-// save saves the state to etcd using the existing lease.
-func (l *LeakyBucketEtcd) save(ctx context.Context, state LeakyBucketState) error {
-	if !l.raceCheck {
-		if _, err := l.cli.Txn(ctx).Then(
-			clientv3.OpPut(etcdKey(l.prefix, etcdKeyLBLast), fmt.Sprintf("%d", state.Last), clientv3.WithLease(l.leaseID)),
-			clientv3.OpPut(etcdKey(l.prefix, etcdKeyLBLease), fmt.Sprintf("%d", l.leaseID), clientv3.WithLease(l.leaseID)),
-		).Commit(); err != nil {
-			return errors.Wrap(err, "failed to commit a transaction to etcd")
-		}
-		return nil
-	}
-	// Put the keys only if they have not been modified since the most recent read.
-	r, err := l.cli.Txn(ctx).If(
-		clientv3.Compare(clientv3.Version(etcdKey(l.prefix, etcdKeyLBLast)), ">", l.lastVersion),
-	).Else(
-		clientv3.OpPut(etcdKey(l.prefix, etcdKeyLBLast), fmt.Sprintf("%d", state.Last), clientv3.WithLease(l.leaseID)),
-		clientv3.OpPut(etcdKey(l.prefix, etcdKeyLBLease), fmt.Sprintf("%d", l.leaseID), clientv3.WithLease(l.leaseID)),
-	).Commit()
-	if err != nil {
-		return errors.Wrap(err, "failed to commit a transaction to etcd")
-	}
-
-	if !r.Succeeded {
-		return nil
-	}
-	return ErrRaceCondition
-}
-
-// SetState updates the state of the bucket in etcd.
-func (l *LeakyBucketEtcd) SetState(ctx context.Context, state LeakyBucketState) error {
-	if l.leaseID == 0 {
-		// Lease does not exist, create one.
-		if err := l.createLease(ctx); err != nil {
-			return err
-		}
-		// No need to send KeepAlive for the newly creates lease: save the state immediately.
-		return l.save(ctx, state)
-	}
-	// Send the KeepAlive request to extend the existing lease.
-	if _, err := l.cli.KeepAliveOnce(ctx, l.leaseID); err == rpctypes.ErrLeaseNotFound {
-		// Create a new lease since the current one has expired.
-		if err = l.createLease(ctx); err != nil {
-			return err
-		}
-	} else if err != nil {
-		return errors.Wrapf(err, "failed to extend the lease '%d'", l.leaseID)
-	}
-
-	return l.save(ctx, state)
-}
-
-const (
 	redisKeyLBLast    = "last"
 	redisKeyLBVersion = "version"
 )
@@ -295,7 +157,7 @@ func (t *LeakyBucketRedis) State(ctx context.Context) (LeakyBucketState, error) 
 		if t.raceCheck {
 			keys = append(keys, redisKey(t.prefix, redisKeyLBVersion))
 		}
-		values, err = t.cli.MGet(keys...).Result()
+		values, err = t.cli.MGet(ctx, keys...).Result()
 	}()
 
 	select {
@@ -353,12 +215,12 @@ func (t *LeakyBucketRedis) SetState(ctx context.Context, state LeakyBucketState)
 	go func() {
 		defer close(done)
 		if !t.raceCheck {
-			err = t.cli.Set(redisKey(t.prefix, redisKeyLBLast), state.Last, t.ttl).Err()
+			err = t.cli.Set(ctx, redisKey(t.prefix, redisKeyLBLast), state.Last, t.ttl).Err()
 			return
 		}
 		var result interface{}
 		// TODO: make use of EVALSHA.
-		result, err = t.cli.Eval(`
+		result, err = t.cli.Eval(ctx, `
 	local version = tonumber(redis.call('get', KEYS[1])) or 0
 	if version > tonumber(ARGV[1]) then
 		return 'RACE_CONDITION'

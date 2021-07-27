@@ -7,10 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/coreos/etcd/clientv3"
-	"github.com/coreos/etcd/etcdserver/api/v3rpc/rpctypes"
-	"github.com/coreos/etcd/mvcc/mvccpb"
-	"github.com/go-redis/redis"
+	redis "github.com/go-redis/redis/v8"
 	"github.com/pkg/errors"
 )
 
@@ -141,182 +138,6 @@ func (t *TokenBucketInMemory) SetState(ctx context.Context, state TokenBucketSta
 }
 
 const (
-	etcdKeyTBLease     = "lease"
-	etcdKeyTBAvailable = "available"
-	etcdKeyTBLast      = "last"
-)
-
-// TokenBucketEtcd is an etcd implementation of a TokenBucketStateBackend.
-//
-// See https://github.com/etcd-io/etcd/blob/master/Documentation/learning/data_model.md
-//
-// etcd is designed to reliably store infrequently updated data, thus it should only be used for the API endpoints which
-// are accessed less frequently than it can be processed by the rate limiter.
-//
-// Aggressive compaction and defragmentation has to be enabled in etcd to prevent the size of the storage
-// to grow indefinitely: every change of the state of the bucket (every access) will create a new revision in etcd.
-//
-// It probably makes it impractical for the high load cases, but can be used to reliably and precisely rate limit an
-// access to the business critical endpoints where each access must be reliably logged.
-type TokenBucketEtcd struct {
-	// prefix is the etcd key prefix.
-	prefix      string
-	cli         *clientv3.Client
-	leaseID     clientv3.LeaseID
-	ttl         time.Duration
-	raceCheck   bool
-	lastVersion int64
-}
-
-// NewTokenBucketEtcd creates a new TokenBucketEtcd instance.
-// Prefix is used as an etcd key prefix for all keys stored in etcd by this algorithm.
-// TTL is a TTL of the etcd lease in seconds used to store all the keys: all the keys are automatically deleted after
-// the TTL expires.
-//
-// If raceCheck is true and the keys in etcd are modified in between State() and SetState() calls then
-// ErrRaceCondition is returned.
-// It does not add any significant overhead as it can be trivially checked on etcd side before updating the keys.
-func NewTokenBucketEtcd(cli *clientv3.Client, prefix string, ttl time.Duration, raceCheck bool) *TokenBucketEtcd {
-	return &TokenBucketEtcd{
-		prefix:    prefix,
-		cli:       cli,
-		ttl:       ttl,
-		raceCheck: raceCheck,
-	}
-}
-
-// etcdKey returns a full etcd key from the provided key and prefix.
-func etcdKey(prefix, key string) string {
-	return fmt.Sprintf("%s/%s", prefix, key)
-}
-
-// parseEtcdInt64 parses the etcd value into int64.
-func parseEtcdInt64(kv *mvccpb.KeyValue) (int64, error) {
-	v, err := strconv.ParseInt(string(kv.Value), 10, 64)
-	if err != nil {
-		return 0, errors.Wrapf(err, "failed to parse key '%s' as int64", string(kv.Key))
-	}
-	return v, nil
-}
-
-func incPrefix(p string) string {
-	b := []byte(p)
-	b[len(b)-1]++
-	return string(b)
-}
-
-// State gets the bucket's current state from etcd.
-// If there is no state available in etcd then the initial bucket's state is returned.
-func (t *TokenBucketEtcd) State(ctx context.Context) (TokenBucketState, error) {
-	// Get all the keys under the prefix in a single request.
-	r, err := t.cli.Get(ctx, t.prefix, clientv3.WithRange(incPrefix(t.prefix)))
-	if err != nil {
-		return TokenBucketState{}, errors.Wrapf(err, "failed to get keys in range ['%s', '%s') from etcd", t.prefix, incPrefix(t.prefix))
-	}
-	if len(r.Kvs) == 0 {
-		// State not found, return zero valued state.
-		return TokenBucketState{}, nil
-	}
-	state := TokenBucketState{}
-	parsed := 0
-	var v int64
-	for _, kv := range r.Kvs {
-		switch string(kv.Key) {
-		case etcdKey(t.prefix, etcdKeyTBAvailable):
-			v, err = parseEtcdInt64(kv)
-			if err != nil {
-				return TokenBucketState{}, err
-			}
-			state.Available = v
-			parsed |= 1
-
-		case etcdKey(t.prefix, etcdKeyTBLast):
-			v, err = parseEtcdInt64(kv)
-			if err != nil {
-				return TokenBucketState{}, err
-			}
-			state.Last = v
-			parsed |= 2
-			t.lastVersion = kv.Version
-
-		case etcdKey(t.prefix, etcdKeyTBLease):
-			v, err = parseEtcdInt64(kv)
-			if err != nil {
-				return TokenBucketState{}, err
-			}
-			t.leaseID = clientv3.LeaseID(v)
-			parsed |= 4
-		}
-	}
-	if parsed != 7 {
-		return TokenBucketState{}, errors.New("failed to get state from etcd: some keys are missing")
-	}
-	return state, nil
-}
-
-// createLease creates a new lease in etcd and updates the t.leaseID value.
-func (t *TokenBucketEtcd) createLease(ctx context.Context) error {
-	lease, err := t.cli.Grant(ctx, int64(t.ttl/time.Nanosecond))
-	if err != nil {
-		return errors.Wrap(err, "failed to create a new lease in etcd")
-	}
-	t.leaseID = lease.ID
-	return nil
-}
-
-// save saves the state to etcd using the existing lease and the fencing token.
-func (t *TokenBucketEtcd) save(ctx context.Context, state TokenBucketState) error {
-	if !t.raceCheck {
-		if _, err := t.cli.Txn(ctx).Then(
-			clientv3.OpPut(etcdKey(t.prefix, etcdKeyTBAvailable), fmt.Sprintf("%d", state.Available), clientv3.WithLease(t.leaseID)),
-			clientv3.OpPut(etcdKey(t.prefix, etcdKeyTBLast), fmt.Sprintf("%d", state.Last), clientv3.WithLease(t.leaseID)),
-			clientv3.OpPut(etcdKey(t.prefix, etcdKeyTBLease), fmt.Sprintf("%d", t.leaseID), clientv3.WithLease(t.leaseID)),
-		).Commit(); err != nil {
-			return errors.Wrap(err, "failed to commit a transaction to etcd")
-		}
-		return nil
-	}
-	// Put the keys only if they have not been modified since the most recent read.
-	r, err := t.cli.Txn(ctx).If(
-		clientv3.Compare(clientv3.Version(etcdKey(t.prefix, etcdKeyTBLast)), ">", t.lastVersion),
-	).Else(
-		clientv3.OpPut(etcdKey(t.prefix, etcdKeyTBAvailable), fmt.Sprintf("%d", state.Available), clientv3.WithLease(t.leaseID)),
-		clientv3.OpPut(etcdKey(t.prefix, etcdKeyTBLast), fmt.Sprintf("%d", state.Last), clientv3.WithLease(t.leaseID)),
-		clientv3.OpPut(etcdKey(t.prefix, etcdKeyTBLease), fmt.Sprintf("%d", t.leaseID), clientv3.WithLease(t.leaseID)),
-	).Commit()
-	if err != nil {
-		return errors.Wrap(err, "failed to commit a transaction to etcd")
-	}
-
-	if !r.Succeeded {
-		return nil
-	}
-	return ErrRaceCondition
-}
-
-// SetState updates the state of the bucket.
-func (t *TokenBucketEtcd) SetState(ctx context.Context, state TokenBucketState) error {
-	if t.leaseID == 0 {
-		// Lease does not exist, create one.
-		if err := t.createLease(ctx); err != nil {
-			return err
-		}
-		// No need to send KeepAlive for the newly created lease: save the state immediately.
-		return t.save(ctx, state)
-	}
-	// Send the KeepAlive request to extend the existing lease.
-	if _, err := t.cli.KeepAliveOnce(ctx, t.leaseID); err == rpctypes.ErrLeaseNotFound {
-		// Create a new lease since the current one has expired.
-		if err = t.createLease(ctx); err != nil {
-			return err
-		}
-	} else if err != nil {
-		return errors.Wrapf(err, "failed to extend the lease '%d'", t.leaseID)
-	}
-	return t.save(ctx, state)
-}
-
-const (
 	redisKeyTBAvailable = "available"
 	redisKeyTBLast      = "last"
 	redisKeyTBVersion   = "version"
@@ -367,7 +188,7 @@ func (t *TokenBucketRedis) State(ctx context.Context) (TokenBucketState, error) 
 		if t.raceCheck {
 			keys = append(keys, redisKey(t.prefix, redisKeyTBVersion))
 		}
-		values, err = t.cli.MGet(keys...).Result()
+		values, err = t.cli.MGet(ctx, keys...).Result()
 	}()
 
 	select {
@@ -419,17 +240,17 @@ func (t *TokenBucketRedis) SetState(ctx context.Context, state TokenBucketState)
 	go func() {
 		defer close(done)
 		if !t.raceCheck {
-			_, err = t.cli.TxPipelined(func(pipeliner redis.Pipeliner) error {
-				if err = pipeliner.Set(redisKey(t.prefix, redisKeyTBLast), state.Last, t.ttl).Err(); err != nil {
+			_, err = t.cli.TxPipelined(ctx, func(pipeliner redis.Pipeliner) error {
+				if err = pipeliner.Set(ctx, redisKey(t.prefix, redisKeyTBLast), state.Last, t.ttl).Err(); err != nil {
 					return err
 				}
-				return pipeliner.Set(redisKey(t.prefix, redisKeyTBAvailable), state.Available, t.ttl).Err()
+				return pipeliner.Set(ctx, redisKey(t.prefix, redisKeyTBAvailable), state.Available, t.ttl).Err()
 			})
 			return
 		}
 		var result interface{}
 		// TODO: use EVALSHA.
-		result, err = t.cli.Eval(`
+		result, err = t.cli.Eval(ctx, `
 	local version = tonumber(redis.call('get', KEYS[1])) or 0
 	if version > tonumber(ARGV[1]) then
 		return 'RACE_CONDITION'

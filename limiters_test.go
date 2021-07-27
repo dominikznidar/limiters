@@ -8,8 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coreos/etcd/clientv3"
-	"github.com/go-redis/redis"
+	redis "github.com/go-redis/redis/v8"
 	"github.com/google/uuid"
 	"github.com/hashicorp/consul/api"
 	"github.com/samuel/go-zookeeper/zk"
@@ -56,7 +55,6 @@ func (c *fakeClock) reset() {
 
 type LimitersTestSuite struct {
 	suite.Suite
-	etcdClient   *clientv3.Client
 	redisClient  *redis.Client
 	consulClient *api.Client
 	zkConn       *zk.Conn
@@ -65,11 +63,6 @@ type LimitersTestSuite struct {
 
 func (s *LimitersTestSuite) SetupSuite() {
 	var err error
-	s.etcdClient, err = clientv3.New(clientv3.Config{
-		Endpoints:   strings.Split(os.Getenv("ETCD_ENDPOINTS"), ","),
-		DialTimeout: time.Second,
-	})
-	s.Require().NoError(err)
 	s.redisClient = redis.NewClient(&redis.Options{
 		Addr: os.Getenv("REDIS_ADDR"),
 	})
@@ -81,7 +74,6 @@ func (s *LimitersTestSuite) SetupSuite() {
 }
 
 func (s *LimitersTestSuite) TearDownSuite() {
-	s.Assert().NoError(s.etcdClient.Close())
 	s.Assert().NoError(s.redisClient.Close())
 }
 
@@ -98,17 +90,14 @@ func (s *LimitersTestSuite) lockers(generateKeys bool) []l.DistLocker {
 func (s *LimitersTestSuite) distLockers(generateKeys bool) []l.DistLocker {
 	randomKey := uuid.New().String()
 	consulKey := randomKey
-	etcdKey := randomKey
 	zkKey := "/" + randomKey
 	if !generateKeys {
 		consulKey = "dist_locker"
-		etcdKey = "dist_locker"
 		zkKey = "/dist_locker"
 	}
 	consulLock, err := s.consulClient.LockKey(consulKey)
 	s.Require().NoError(err)
 	return []l.DistLocker{
-		l.NewLockEtcd(s.etcdClient, etcdKey, s.logger),
 		l.NewLockConsul(consulLock),
 		l.NewLockZookeeper(zk.NewLock(s.zkConn, zkKey, zk.WorldACL(zk.PermAll))),
 	}
