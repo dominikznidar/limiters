@@ -24,8 +24,6 @@ func (s *LimitersTestSuite) leakyBuckets(capacity int64, rate time.Duration, clo
 func (s *LimitersTestSuite) leakyBucketBackends() []l.LeakyBucketStateBackend {
 	return []l.LeakyBucketStateBackend{
 		l.NewLeakyBucketInMemory(),
-		l.NewLeakyBucketEtcd(s.etcdClient, uuid.New().String(), time.Second, false),
-		l.NewLeakyBucketEtcd(s.etcdClient, uuid.New().String(), time.Second, true),
 		l.NewLeakyBucketRedis(s.redisClient, uuid.New().String(), time.Second, false),
 		l.NewLeakyBucketRedis(s.redisClient, uuid.New().String(), time.Second, true),
 	}

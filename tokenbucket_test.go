@@ -82,8 +82,6 @@ func (s *LimitersTestSuite) tokenBuckets(capacity int64, refillRate time.Duratio
 func (s *LimitersTestSuite) tokenBucketBackends() []l.TokenBucketStateBackend {
 	return []l.TokenBucketStateBackend{
 		l.NewTokenBucketInMemory(),
-		l.NewTokenBucketEtcd(s.etcdClient, uuid.New().String(), time.Second, false),
-		l.NewTokenBucketEtcd(s.etcdClient, uuid.New().String(), time.Second, true),
 		l.NewTokenBucketRedis(s.redisClient, uuid.New().String(), time.Second, false),
 		l.NewTokenBucketRedis(s.redisClient, uuid.New().String(), time.Second, true),
 	}
